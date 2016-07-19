@@ -1,7 +1,13 @@
 package com.chester;
 
 import java.io.IOException;
+import java.lang.management.LockInfo;
+import java.lang.management.MonitorInfo;
+import java.lang.management.ThreadInfo;
+import java.lang.management.ThreadMXBean;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Set;
@@ -12,49 +18,320 @@ import javax.management.IntrospectionException;
 import javax.management.MBeanAttributeInfo;
 import javax.management.MBeanException;
 import javax.management.MBeanInfo;
+import javax.management.MBeanOperationInfo;
 import javax.management.MBeanServerConnection;
 import javax.management.MalformedObjectNameException;
 import javax.management.ObjectInstance;
 import javax.management.ObjectName;
 import javax.management.ReflectionException;
+import javax.management.openmbean.CompositeDataSupport;
 import javax.management.remote.JMXConnector;
 import javax.management.remote.JMXConnectorFactory;
 import javax.management.remote.JMXServiceURL;
 
+import org.apache.commons.lang3.ClassUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.lang3.builder.ReflectionToStringBuilder;
 import org.kohsuke.args4j.Argument;
 import org.kohsuke.args4j.CmdLineException;
 import org.kohsuke.args4j.CmdLineParser;
+import org.kohsuke.args4j.Option;
+
+import static java.lang.management.ManagementFactory.THREAD_MXBEAN_NAME;
+import static java.lang.management.ManagementFactory.getThreadMXBean;
+import static java.lang.management.ManagementFactory.newPlatformMXBeanProxy;
 
 /**
  * Main JMX command line client.
  */
 public class JMXCLI {
+	private class Attribute {
+		private static final String COMPOSITE_ATTRIBUTE_DELIMITER = ".";
+		private String attribute;
+		private MBeanServerConnection connection;
+		ObjectName obj;
 
-    @Argument(required = true, index = 0, usage = "Action to perform [list|get]")
-    private String action;
-    
-    @Argument(required = true, index = 1, usage = "hostname:port of the jmx server, e.g. localhost:8090")
+		boolean isCompositeAttribute() {
+			return attribute.contains(COMPOSITE_ATTRIBUTE_DELIMITER);
+		}
+
+		Attribute(MBeanServerConnection connection, ObjectName obj, String attribute) {
+			this.attribute = attribute;
+			this.obj = obj;
+			this.connection = connection;
+		}
+
+		String get() throws InstanceNotFoundException,ReflectionException,AttributeNotFoundException,MBeanException {
+			Object value;
+
+			try {
+
+				if (isCompositeAttribute()) {
+					String[] compositeAttribute = attribute.split("\\" + COMPOSITE_ATTRIBUTE_DELIMITER);
+					Object rawAttributeValue = connection.getAttribute(obj, compositeAttribute[0]);
+
+					if (rawAttributeValue instanceof CompositeDataSupport) {
+						value = ((CompositeDataSupport) rawAttributeValue).get(compositeAttribute[1]);
+
+						if (value == null) {
+							throw new AttributeNotFoundException();
+						}
+					} else {
+						throw new RuntimeException("The following attribute is not a composite attribute : " + attribute);
+					}
+
+				} else {
+					value = connection.getAttribute(obj, attribute);
+				}
+
+			} catch (AttributeNotFoundException e) {
+				throw new RuntimeException("Attribute (" + attribute + ") not found on " + obj);
+			} catch (Exception e) {
+				throw new RuntimeException("Problem reading attribute (" + attribute + ") not found on " + obj, e);
+			}
+
+			if(ClassUtils.isPrimitiveOrWrapper(value.getClass())) {
+				return value.toString();
+			} else {
+				return ReflectionToStringBuilder.toString(value);
+			}
+		}
+	}
+
+	/**
+	 * Example of using the java.lang.management API to dump stack trace and to
+	 * perform deadlock detection.
+	 *
+	 * @author Mandy Chung
+	 * @version %% 12/22/05
+	 */
+	static class ThreadMonitor {
+		private MBeanServerConnection server;
+
+		private ThreadMXBean tmbean;
+
+		private ObjectName objname;
+
+		// default - JDK 6+ VM
+		private String findDeadlocksMethodName = "findDeadlockedThreads";
+
+		private boolean canDumpLocks = true;
+
+		/**
+		 * Constructs a ThreadMonitor object to get thread information in a remote
+		 * JVM.
+		 */
+		public ThreadMonitor(MBeanServerConnection server) throws IOException {
+			this.server = server;
+			this.tmbean = newPlatformMXBeanProxy(server, THREAD_MXBEAN_NAME, ThreadMXBean.class);
+			try {
+				objname = new ObjectName(THREAD_MXBEAN_NAME);
+			} catch (MalformedObjectNameException e) {
+				// should not reach here
+				InternalError ie = new InternalError(e.getMessage());
+				ie.initCause(e);
+				throw ie;
+			}
+			parseMBeanInfo();
+		}
+
+		/**
+		 * Constructs a ThreadMonitor object to get thread information in the local
+		 * JVM.
+		 */
+		public ThreadMonitor() {
+			this.tmbean = getThreadMXBean();
+		}
+
+		/**
+		 * Prints the thread dump information to System.out.
+		 */
+		public void threadDump() {
+			if (canDumpLocks) {
+				if (tmbean.isObjectMonitorUsageSupported() && tmbean.isSynchronizerUsageSupported()) {
+					// Print lock info if both object monitor usage
+					// and synchronizer usage are supported.
+					// This sample code can be modified to handle if
+					// either monitor usage or synchronizer usage is supported.
+					dumpThreadInfoWithLocks();
+				}
+			} else {
+				dumpThreadInfo();
+			}
+		}
+
+		private void dumpThreadInfo() {
+			System.out.println("Full Java thread dump");
+			long[] tids = tmbean.getAllThreadIds();
+			ThreadInfo[] tinfos = tmbean.getThreadInfo(tids, Integer.MAX_VALUE);
+			for (ThreadInfo ti : tinfos) {
+				printThreadInfo(ti);
+			}
+		}
+
+		/**
+		 * Prints the thread dump information with locks info to System.out.
+		 */
+		private void dumpThreadInfoWithLocks() {
+			System.out.println("Full Java thread dump with locks info");
+
+			ThreadInfo[] tinfos = tmbean.dumpAllThreads(true, true);
+			for (ThreadInfo ti : tinfos) {
+				printThreadInfo(ti);
+				LockInfo[] syncs = ti.getLockedSynchronizers();
+				printLockInfo(syncs);
+			}
+			System.out.println();
+		}
+
+		private final String INDENT = "    ";
+
+		private void printThreadInfo(ThreadInfo ti) {
+			// print thread information
+			printThread(ti);
+
+			// print stack trace with locks
+			StackTraceElement[] stacktrace = ti.getStackTrace();
+			MonitorInfo[] monitors = ti.getLockedMonitors();
+			for (int i = 0; i < stacktrace.length; i++) {
+				StackTraceElement ste = stacktrace[i];
+				System.out.println(INDENT + "at " + ste.toString());
+				for (MonitorInfo mi : monitors) {
+					if (mi.getLockedStackDepth() == i) {
+						System.out.println(INDENT + "  - locked " + mi);
+					}
+				}
+			}
+			System.out.println();
+		}
+
+		private void printThread(ThreadInfo ti) {
+			StringBuilder sb = new StringBuilder("\"" + ti.getThreadName() + "\"" + " Id="
+					+ ti.getThreadId() + " in " + ti.getThreadState());
+			if (ti.getLockName() != null) {
+				sb.append(" on lock=" + ti.getLockName());
+			}
+			if (ti.isSuspended()) {
+				sb.append(" (suspended)");
+			}
+			if (ti.isInNative()) {
+				sb.append(" (running in native)");
+			}
+			System.out.println(sb.toString());
+			if (ti.getLockOwnerName() != null) {
+				System.out.println(INDENT + " owned by " + ti.getLockOwnerName() + " Id="
+						+ ti.getLockOwnerId());
+			}
+		}
+
+		private void printMonitorInfo(ThreadInfo ti, MonitorInfo[] monitors) {
+			System.out.println(INDENT + "Locked monitors: count = " + monitors.length);
+			for (MonitorInfo mi : monitors) {
+				System.out.println(INDENT + "  - " + mi + " locked at ");
+				System.out.println(INDENT + "      " + mi.getLockedStackDepth() + " "
+						+ mi.getLockedStackFrame());
+			}
+		}
+
+		private void printLockInfo(LockInfo[] locks) {
+			System.out.println(INDENT + "Locked synchronizers: count = " + locks.length);
+			for (LockInfo li : locks) {
+				System.out.println(INDENT + "  - " + li);
+			}
+			System.out.println();
+		}
+
+		/**
+		 * Checks if any threads are deadlocked. If any, print the thread dump
+		 * information.
+		 */
+		public boolean findDeadlock() {
+			long[] tids;
+			if (findDeadlocksMethodName.equals("findDeadlockedThreads")
+					&& tmbean.isSynchronizerUsageSupported()) {
+				tids = tmbean.findDeadlockedThreads();
+				if (tids == null) {
+					return false;
+				}
+
+				System.out.println("Deadlock found :-");
+				ThreadInfo[] infos = tmbean.getThreadInfo(tids, true, true);
+				for (ThreadInfo ti : infos) {
+					printThreadInfo(ti);
+					printLockInfo(ti.getLockedSynchronizers());
+					System.out.println();
+				}
+			} else {
+				tids = tmbean.findMonitorDeadlockedThreads();
+				if (tids == null) {
+					return false;
+				}
+				ThreadInfo[] infos = tmbean.getThreadInfo(tids, Integer.MAX_VALUE);
+				for (ThreadInfo ti : infos) {
+					// print thread information
+					printThreadInfo(ti);
+				}
+			}
+
+			return true;
+		}
+
+		private void parseMBeanInfo() throws IOException {
+			try {
+				MBeanOperationInfo[] mopis = server.getMBeanInfo(objname).getOperations();
+
+				// look for findDeadlockedThreads operations;
+				boolean found = false;
+				for (MBeanOperationInfo op : mopis) {
+					if (op.getName().equals(findDeadlocksMethodName)) {
+						found = true;
+						break;
+					}
+				}
+				if (!found) {
+					// if findDeadlockedThreads operation doesn't exist,
+					// the target VM is running on JDK 5 and details about
+					// synchronizers and locks cannot be dumped.
+					findDeadlocksMethodName = "findMonitorDeadlockedThreads";
+					canDumpLocks = false;
+				}
+			} catch (IntrospectionException e) {
+				InternalError ie = new InternalError(e.getMessage());
+				ie.initCause(e);
+				throw ie;
+			} catch (InstanceNotFoundException e) {
+				InternalError ie = new InternalError(e.getMessage());
+				ie.initCause(e);
+				throw ie;
+			} catch (ReflectionException e) {
+				InternalError ie = new InternalError(e.getMessage());
+				ie.initCause(e);
+				throw ie;
+			}
+		}
+	}
+
+
+	@Option(name = "-auth", usage = "username:password of secured JMX Connection")
+	private String auth;
+
+    @Argument(required = true, index = 0, usage = "hostname:port of the jmx server, e.g. localhost:8090")
     private String hostPort;
 
-    @Argument(required = true, index = 2, usage = "username of the secured JMX Server")
-    private String username;
-    
-    @Argument(required = true, index = 3, usage = "password of the secured JMX Server") 
-    private String password;
-    
-    @Argument(required = false, index = 4, usage = "Name of the JMX object, e.g. com.mchange.v2.c3p0:type=PooledDataSource.* will return the first matching object")
+    @Argument(required = false, index = 1, usage = "Name of the JMX object, e.g. com.mchange" +
+			".v2.c3p0:type=PooledDataSource.* will return the first matching object")
     private String objectName;
 
-    @Argument(required = false, index = 5, usage = "Attribute name of the JMX object, e.g. numBusyConnections")
+    @Argument(required = false, index = 2, usage = "Attribute name of the JMX object, e.g. numBusyConnections")
     private String attributeName;
-    
-    @Argument(required = false, index = 6, usage = "Whether to loop infinitely [true|false]")
-    private Boolean infinite = false;
-    
-    @Argument(required = false, index = 7, usage = "Time to pause between runs in seconds]")
-    private long pause;
 
-    private JMXConnector jmxConnector;
+    @Argument(required = false, index = 3, usage = "Time to pause between runs in seconds]")
+    private long pause = 10;
+
+	@Argument(required = false, index = 4, usage = "How many times to iterate")
+	private long runCount = 1;
+
+	private JMXConnector jmxConnector;
 
     private boolean printheader = false;
 
@@ -78,10 +355,16 @@ public class JMXCLI {
 
                 JMXServiceURL serviceURL = new JMXServiceURL("service:jmx:rmi:///jndi/rmi://" + parsedHost + ":" + parsedPort + "/jmxrmi");
 
-                HashMap<String, String[]> credentials = new HashMap<String, String[]>();
-                credentials.put(JMXConnector.CREDENTIALS, new String[] { this.username, this.password });
-                                               
-                if (infinite && printheader) {
+				HashMap<String, String[]> credentials = new HashMap<String, String[]>();
+
+				if (StringUtils.isNotBlank(this.auth)) {
+					String[] auth = StringUtils.split(this.auth,":",2);
+					if(auth.length == 2) {
+						credentials.put(JMXConnector.CREDENTIALS, new String[]{auth[0], auth[1]});
+					}
+				}
+
+                if (runCount == 0 && printheader) {
                     System.out.println("Created connection with service URL: " + serviceURL);
                     System.out.println("Will execute until CTRL-C received");
                 }
@@ -155,14 +438,10 @@ public class JMXCLI {
         }
     }
 
-    public void printAttributes(String name) {
-        for (String attribute : getAttributeList(name)) {
-            System.out.println(attribute);
-        }
-    }
 
-    public List<String> getAttributeList(String name) {
-        List<String> attributes = new ArrayList<String>();
+
+    public List<String[]> getAttributeList(String name) {
+        List<String[]> attributes = new ArrayList<>();
         ObjectName oName = null;
         if (name != null) {
             oName = createJmxObject(name);
@@ -171,7 +450,7 @@ public class JMXCLI {
         try {
             MBeanInfo info = jmxConnector.getMBeanServerConnection().getMBeanInfo(oName);
             for (MBeanAttributeInfo att : info.getAttributes()) {
-                attributes.add(" - " + att.getName() + " [" + att.getType() + "] " + att.getDescription());
+                attributes.add(new String[]{att.getName(), att.getType(), att.getDescription()});
             }
 
         } catch (ReflectionException e) {
@@ -194,8 +473,9 @@ public class JMXCLI {
 
                 ObjectName obj = createJmxObject(name);
                 MBeanServerConnection connection = jmxConnector.getMBeanServerConnection();
+				Attribute attr = new Attribute(connection, obj, attribute);
 
-                return connection.getAttribute(obj, attribute).toString();
+                return attr.get();
 
             } catch (InstanceNotFoundException e) {
                 System.err.println("InstanceNotFoundException " + e);
@@ -233,24 +513,43 @@ public class JMXCLI {
         return attributeName;
     }
     
-    private boolean getInfinite() {
-        return infinite;
+    private long getRunCount() {
+        return runCount;
     }
 
-    private String findObject(String objectNameToFind) {
+	private List<String> findObjects(String objectNameToFind) {
+		List<String> ret = new ArrayList<>();
 
-        List<String> objectNames = getObjectNameList();
-        for (String name : objectNames) {
-            if (name.matches(objectNameToFind)) {
-                return name;
-            }
-        }
-        return "";
-    }
-    
-    private String getAction() {
-        return action;
-    }
+		if(!objectNameToFind.contains("*")) {
+			ret.add(objectNameToFind);
+			return ret;
+		}
+		List<String> objectNames = getObjectNameList();
+		for (String name : objectNames) {
+			if (name.matches(objectNameToFind)) {
+				ret.add(name);
+			}
+		}
+		return ret;
+	}
+
+	private List<String> findAttributes(String object, String attributeNameToFind) {
+		List<String> ret = new ArrayList<>();
+
+		if(!attributeNameToFind.contains("*")) {
+			ret.add(attributeNameToFind);
+			return ret;
+		}
+
+		List<String[]> attributeList = getAttributeList(object);
+		for (String[] name : attributeList) {
+			if (name[0].matches(attributeNameToFind)) {
+				ret.add(name[0]);
+			}
+		}
+		return ret;
+	}
+
 
     private long getPause() {        
         return pause * 1000;
@@ -264,22 +563,18 @@ public class JMXCLI {
 
         try {
             parser.parseArgument(args);            
-            String action = client.getAction();                        
             client.connect();
 
-            if (action.equals("get")) {
-                
-                getObject(client);
-                
-            } else if (action.equals("attr")) {
-                
-                listAttributes(client);
-                
-            } else if (action.equals("list")) {
-                
+
+            if (StringUtils.isBlank(client.getObjectName())) {
                 listObjects(client);
-                
-            }
+			} else if (client.getObjectName().equals("threads")) {
+				listThreads(client);
+			} else if (StringUtils.isBlank(client.getAttributeName())) {
+				listAttributes(client);
+			} else {
+				getObject(client);
+			}
             
         } catch (CmdLineException e) {
             System.err.println(e.getMessage());
@@ -293,45 +588,68 @@ public class JMXCLI {
     }
 
     private static void listObjects(JMXCLI client) {
-        
-        System.out.println("Listing JMX objects for client");        
-        for (String objectName: client.getObjectNameList()) {            
-            System.out.println(String.format("Found object: %s", objectName));
+		final List<String> nameList = client.getObjectNameList();
+
+		if(nameList.isEmpty()) {
+			System.out.println("Listing JMX objects for client returns nothing");
+		}
+        for (String objectName: nameList) {
+            System.out.println(objectName);
         }
     }
 
-    private static void listAttributes(JMXCLI client) {
-        
-        System.out.println(String.format("JMX Attributes for %s", client.getObjectName()));
-        if (client.getObjectName() != null) {
-            for (String attributeName: client.getAttributeList(client.getObjectName())) {                
-                System.out.println(String.format("Found JMX attribute: %s", attributeName));
-            }
-        } else {
-            System.out.println("You must specify an JMX objectname");
-        }
-    }
+	private static void listAttributes(JMXCLI client) {
+		System.out.println(String.format("## JMX Attributes for %s", client.getObjectName()));
+		if (client.getObjectName() != null) {
+
+			for (String[] attributeName: client.getAttributeList(client.getObjectName())) {
+				System.out.println(attributeName[0] + " [" + attributeName[1] + "] " + attributeName[2]);
+			}
+		} else {
+			System.out.println("## You must specify an JMX objectname");
+		}
+	}
+
+	private static void listThreads(JMXCLI client){
+
+		ThreadMonitor monitor = null;
+		try {
+			monitor = new ThreadMonitor(client.jmxConnector.getMBeanServerConnection());
+		} catch (IOException e) {
+			e.printStackTrace();
+		}
+		monitor.threadDump();
+	}
 
     private static void getObject(JMXCLI client) {
-                
-        String objectName = client.getObjectName();
-        if (objectName.contains("*")) {
-            objectName = client.findObject(objectName);
-        }               
-   
-        if (client.getInfinite()) {
-            
-            while (true) {
-                String attribute = client.getAttributeName();
-                System.out.println(String.format("%s", client.getAttribute(objectName, attribute)));
-                try {
-                    Thread.sleep(client.getPause());
-                } catch (InterruptedException e) {                        
-                }
-            }                   
-        } else {
-            String attribute = client.getAttributeName();
-            System.out.println(String.format("%s", client.getAttribute(objectName, attribute)));
+
+
+		HashMap<String,List<String>> attributes = new HashMap<>();
+
+		for(String objectName: client.findObjects(client.getObjectName())) {
+			attributes.put(objectName, client.findAttributes(objectName, client.getAttributeName()));
+		}
+
+        long runCount = 0;
+        while ( client.getRunCount() == 0 || runCount < client.getRunCount() ) {
+
+        	if (runCount++ > 0) {
+				try {
+					Thread.sleep(client.getPause());
+					System.out.println(String.format("##### " + new SimpleDateFormat("yyyy-MM-dd HH:mm:ss")
+							.format(new Date())));
+				} catch (InterruptedException e) {
+				}
+			}
+
+            for (String objectName: attributes.keySet()) {
+				if (attributes.size()>1) {
+					System.out.println("#### " + objectName);
+				}
+				for (String attribute: attributes.get(objectName) ) {
+					System.out.println(String.format("%s=%s", attribute, client.getAttribute(objectName, attribute)));
+				}
+			}
         }
     }   
 }
